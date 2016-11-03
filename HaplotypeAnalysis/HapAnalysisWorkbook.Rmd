@@ -1,0 +1,178 @@
+---
+title: "Medicago_Haplotype_Analysis"
+author: "Nick Burns"
+date: "2 November 2016"
+output: html_document
+---
+
+# Medicago Haplotype Analysis  
+
+There are all sort of fancy programs for haplotype estimation (fastPhase, Beagle, shapeit2), which all seem to have good reviews. Shapeit2 looked promising, as it  was compatible with plink files. However, you need a genetic map (base position, recombination rate, centomorgans distance), which we don't have. Beagle is written in java - so just not going there. And fastPhase has a horrendous file format, so not going there. Really though, I don't think we need naything super fancy. Plink's haplotype block estimation should be sufficient in the first instance.
+
+There are a few tricks with plink though. We need variant IDs, which we just don't have. So we will create artifical ids. No real issue. Then we should be good to go.
+
+## QC & Genotype prep  
+
+Remove suspect genotypes, recode to plink and insert articial variant ids.
+
+```{r}
+setwd("/mnt/DataDrive/MedicagoFiles/Analyses/HaplotypeAnalysis/")
+
+plink_ <- "/mnt/DataDrive/MedicagoFiles/Analyses/Pipeline/PLINK/plink"
+
+cmd <- sprintf("
+    %s --bcf chr7-filtered-set-2014Apr15.bcf \\
+          --const-fid \\
+          --allow-extra-chr \\
+          --geno 0.1 \\
+          --maf 0.03 \\
+          --make-bed \\
+          --set-missing-var-ids @:#[b37] \\
+          --out genotypes
+
+", plink_)
+system(cmd)
+```
+
+## Haplotype block estimation  
+
+```{r}
+system(sprintf("%s --bfile genotypes --blocks no-pheno-req --out hap_blocks", plink_))
+```
+
+## Haplotype analysis  
+
+Create principal components, then run association test. 
+
+Reference: http://pngu.mgh.harvard.edu/~purcell/plink/haplo.shtml#hap1 
+
+NOTE: one huuuuuuge caveat, need to use plink1.07 for haplotype analysis, as they openly admit that it is poor :) This has been removed from plink1.9 for now, and will be reimplemented later. They suggest using BEAGLE instead. I will do this later. 
+
+To recode to beagle: you can use --recode beagle 
+
+
+```{r}
+system(sprintf("%s --bfile genotypes --pca 10 --out pop_structure", plink_))
+
+plink1 <- "/mnt/DataDrive/MedicagoFiles/Analyses/HaplotypeAnalysis/plink-1.07-x86_64/plink"
+system(sprintf("
+           %s --bfile genotypes \\
+              --hap-linear \\
+              --hap hap_blocks.blocks \\
+              --covar pop_structure.eigenvec \\
+              --pheno StantonFloweringDate.csv \\
+              --adjust \\
+              --allow-no-sex \\
+              --no-web \\
+              --out hap_analysis
+       ", plink1))
+```
+
+## Visualis results
+
+```{r}
+library(data.table)
+library(ggplot2)
+
+#setwd("/mnt/DataDrive/MedicagoFiles/Analyses/HaplotypeAnalysis/")
+
+gwas <- fread("/mnt/DataDrive/MedicagoFiles/Analyses/Pipeline/Results/StantonFloweringDate_assoc_results.csv")
+haplotype <- fread("/mnt/DataDrive/MedicagoFiles/Analyses/HaplotypeAnalysis/hap_analysis.assoc.hap.linear")
+
+# g <- ggplot(gwas[CHR == 7 & P < 0.001], aes(x = BP, y = -log10(P))) +
+#  geom_point(colour = "darkgrey", alpha = 0.4) +
+#  theme_minimal()
+# 
+# 
+# g +
+#  geom_point(data = haplotype[P < 0.001],
+#             aes(x = (BP1 + BP2) / 2, y = -log10(P),
+#                 colour = factor(sign(BETA)), hap = HAPLOTYPE, estimate = BETA),
+#             size = 2, alpha = 0.5) +
+#      scale_colour_manual(values = c("#f442bc", "#4286f4"))
+
+library(plotly)
+
+g <- ggplot(haplotype[P < 0.001],
+            aes(x = (BP1 + BP2) / 2,
+                y = -log10(P),
+                hap = HAPLOTYPE,
+                estimate = BETA)) +
+    geom_point(aes(colour = factor(sign(BETA))), alpha = 0.5, size = 2) +
+    scale_colour_manual(values = c("#f442bc", "#4286f4")) +
+    guides(colour = "none") +
+    ggtitle("Medicago, chromosome 7") +
+    xlab("Position (MB)") +
+    theme_minimal()
+
+ggplotly(g, tooltip = c("hap", "estimate"))
+```
+
+Despite plink's warning, there is really good agreement there between the two methods. Especially if we consider only genome-wide significant results.
+
+Does this take us to that next level of aggregation? Yes. But, it hasn't really reduced the size of the problem enough that we can easily interpret the results. But... we can set a threshold, say ```eps = 1e-08``` and look at the haplotypes below this:
+
+```{r}
+eps <- 1e-08
+haplotype[order(P, decreasing = FALSE)][1:30]
+```
+
+This is getting interesting now right... There are only 22 haplotypes, 20 of them seem to lower the response and 2 increase the response.
+
+
+### Zooming in...  
+
+Going to add genes to this plot...
+
+Gene annotations downloaded from : http://www.jcvi.org/medicago/display.php?pageName=General&section=Download
+
+```{r}
+genes <- fread("../../GeneContext/Mt4.0v1_genes_20130731_1800.gff3")
+genes
+```
+
+this is a very annoying file, let's parse the gene names
+
+```{r}
+colnames(genes) <- c("CHR", "Source", "Type", "Start", "End", "V6", "Strand", "V8", "ID")
+gene_names <- unlist(lapply(genes[, ID], function (x) strsplit(x, "=")[[1]][3]))
+genes[, GeneName := gene_names]
+```
+
+plot... Let's do this with plotly. Will plot the whole lot and zoom in as required. 
+
+```{r}
+lcl_genes <- genes[Type == "mRNA" & CHR == "chr7" & Start > 30000000 & End < 40000000][, .(CHR, Start, End, GeneName)]
+
+lcl_genes <- lcl_genes[, .(CHR = unique(CHR), Start = min(Start), End = max(End)), by = GeneName]
+lcl_genes
+
+g <- ggplot(haplotype[P < 0.001], 
+            aes(x = (BP1 + BP2) / 2, 
+                y = -log10(P),
+                hap = HAPLOTYPE,
+                estimate = BETA)) +
+    geom_point(aes(colour = factor(sign(BETA))), alpha = 0.5) +
+    scale_colour_manual(values = c("#f442bc", "#4286f4")) +
+    guides(colour = "none") +
+    ggtitle("Medicago, chromosome 7") +
+    xlab("Position (MB)") +
+    theme_minimal()
+
+lcl_genes[, YValues := seq(-5, -20, by = -4)]
+# a dirty fudge to get the aesthetics to work...
+lcl_genes[, HAPLOTYPE := 1]
+lcl_genes[, BETA := 1]
+g2 <- g + geom_segment(data = lcl_genes,
+                       aes(x = Start, xend = End, y = YValues, yend = YValues),
+                       colour = "darkblue", size = 0.5) +
+    geom_text(data = lcl_genes,
+              aes(x = (Start + End) / 2, y = YValues + 1, label = GeneName),
+              colour = "darkblue", size = 3)
+
+g2
+
+ggplotly(g2)
+```
+
+this didn't work at all. nasty.
